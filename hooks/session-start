@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Session Normalizer — SessionStart hook
+# 1. Auto-deletes junk sessions
+# 2. Outputs project-relevant session list as context for Claude
+
+set -euo pipefail
+
+PROJECTS_DIR="${HOME}/.claude/projects"
+CWD="${PWD}"
+
+# Bail if no projects directory
+if [ ! -d "$PROJECTS_DIR" ]; then
+  exit 0
+fi
+
+# Run cleanup + session listing via python3
+OUTPUT=$(python3 -c "
+import json, os, glob, shutil
+from datetime import datetime
+
+projects_dir = os.path.expanduser('$PROJECTS_DIR')
+cwd = '''$CWD'''
+home = os.path.expanduser('~')
+
+# --- Phase 1: Auto-delete junk sessions ---
+deleted = 0
+for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
+    messages = []
+    first_content = ''
+    try:
+        with open(jsonl) as f:
+            for line in f:
+                try:
+                    d = json.loads(line.strip())
+                    if d.get('type') == 'user':
+                        content = d.get('message', {}).get('content', '')
+                        if isinstance(content, list):
+                            text_parts = [c.get('text','') for c in content if c.get('type') == 'text']
+                            content = ' '.join(text_parts)
+                        if isinstance(content, str) and content.strip():
+                            messages.append(content.strip())
+                            if not first_content:
+                                first_content = content.strip()
+                except:
+                    pass
+    except:
+        continue
+
+    delete = False
+
+    # Zero messages
+    if len(messages) == 0:
+        delete = True
+
+    # 1-msg auto-generated sessions
+    if len(messages) <= 1:
+        auto_prefixes = [
+            'You are a QA lead', 'You are a Playwright',
+            'You are a security-focused', 'You are a blog content',
+            'You are a QA report', 'Respond with ONLY'
+        ]
+        if any(first_content.startswith(p) for p in auto_prefixes):
+            delete = True
+
+    # Empty exit-only sessions
+    if len(messages) <= 3 and messages and all(
+        m.startswith('<local-command') or m.startswith('<command-name>') or
+        any(kw in m.lower() for kw in ['exit', 'goodbye', 'bye', 'see ya', 'caveat'])
+        for m in messages
+    ):
+        delete = True
+
+    if delete:
+        try:
+            os.remove(jsonl)
+            session_dir = jsonl.replace('.jsonl', '')
+            if os.path.isdir(session_dir):
+                shutil.rmtree(session_dir, ignore_errors=True)
+            deleted += 1
+        except:
+            pass
+
+# Clean session indexes
+for idx_file in glob.glob(os.path.join(projects_dir, '*/sessions-index.json')):
+    try:
+        with open(idx_file) as f:
+            data = json.load(f)
+        original = len(data.get('entries', []))
+        data['entries'] = [e for e in data.get('entries', []) if os.path.exists(e.get('fullPath', ''))]
+        if len(data['entries']) < original:
+            with open(idx_file, 'w') as f:
+                json.dump(data, f, indent=2)
+    except:
+        pass
+
+# --- Phase 2: Gather sessions ---
+all_entries = []
+
+# From indexes
+for idx_file in glob.glob(os.path.join(projects_dir, '*/sessions-index.json')):
+    try:
+        with open(idx_file) as f:
+            data = json.load(f)
+        for e in data.get('entries', []):
+            all_entries.append(e)
+    except:
+        continue
+
+# Unindexed JSONL files
+indexed_sids = {e['sessionId'] for e in all_entries}
+for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
+    sid = os.path.basename(jsonl).replace('.jsonl', '')
+    if sid in indexed_sids:
+        continue
+    msg_count = 0
+    first_prompt = ''
+    session_cwd = ''
+    try:
+        with open(jsonl) as f:
+            for line in f:
+                try:
+                    d = json.loads(line.strip())
+                    if d.get('type') == 'user':
+                        msg_count += 1
+                        if not first_prompt:
+                            c = d.get('message', {}).get('content', '')
+                            if isinstance(c, str):
+                                first_prompt = c[:60]
+                        if not session_cwd:
+                            session_cwd = d.get('cwd', '')
+                except:
+                    pass
+    except:
+        continue
+    if msg_count > 0:
+        all_entries.append({
+            'sessionId': sid,
+            'summary': first_prompt or 'Untitled',
+            'messageCount': msg_count,
+            'modified': '',
+            'projectPath': session_cwd or '',
+        })
+
+if not all_entries and deleted == 0:
+    exit(0)
+
+# Sort by modified date
+all_entries.sort(key=lambda e: e.get('modified', '') or '0', reverse=True)
+
+# Separate matching vs other
+matching = []
+others = []
+project_name = os.path.basename(cwd)
+
+for e in all_entries:
+    proj = e.get('projectPath', '')
+    summary = e.get('summary', 'Untitled')
+    sid = e.get('sessionId', '')
+    modified = e.get('modified', '')
+    count = e.get('messageCount', 0)
+
+    try:
+        dt = datetime.fromisoformat(modified.replace('Z', '+00:00'))
+        date_str = dt.strftime('%b %d, %H:%M')
+    except:
+        date_str = 'recent'
+
+    if len(summary) > 55:
+        summary = summary[:52] + '...'
+
+    entry = f'  {summary} | {date_str} | {count} msgs | {sid}'
+
+    # Match: exact, child, or specific parent (not home)
+    if proj == cwd:
+        matching.append(entry)
+    elif proj.startswith(cwd + '/'):
+        matching.append(entry)
+    elif cwd.startswith(proj + '/') and proj != home:
+        matching.append(entry)
+    elif len(others) < 5:
+        others.append(entry)
+
+# Build output
+lines = []
+lines.append('--- SESSION NORMALIZER ---')
+
+if deleted > 0:
+    lines.append(f'Cleaned up {deleted} empty/junk sessions.')
+
+lines.append('')
+
+if matching:
+    lines.append(f'Sessions in this project ({project_name}):')
+    for m in matching[:5]:
+        lines.append(m)
+    if len(matching) > 1:
+        lines.append(f'  ({len(matching)} sessions — consider merging with /normalize-sessions)')
+    lines.append('')
+
+if others:
+    lines.append('Other recent sessions:')
+    for o in others[:3]:
+        lines.append(o)
+    lines.append('')
+
+lines.append('To resume: /resume')
+lines.append('To merge old sessions: /normalize-sessions')
+
+print('\\n'.join(lines))
+" 2>/dev/null)
+
+# Exit silently if no output
+if [ -z "$OUTPUT" ]; then
+  exit 0
+fi
+
+# Escape for JSON
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+ESCAPED=$(escape_for_json "$OUTPUT")
+
+# Output in platform-appropriate format
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  printf '{\n  "additional_context": "%s"\n}\n' "$ESCAPED"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$ESCAPED"
+else
+  printf '{\n  "additionalContext": "%s"\n}\n' "$ESCAPED"
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+{
+  "name": "session-normalizer",
+  "description": "Auto-cleanup junk sessions, show project-relevant sessions on startup, merge old sessions into docs",
+  "version": "1.0.0",
+  "author": {
+    "name": "Yehuda"
+  },
+  "keywords": ["sessions", "cleanup", "normalization", "productivity"]
+}
