@@ -93,6 +93,18 @@ Works on macOS, Linux, and Windows (via Git Bash). No external dependencies beyo
 
 ## Changelog
 
+### v3.0.0 — infrastructure for project-first model
+
+v3.0 is the **infrastructure batch** of the v3 redesign. No user-facing UX changes yet; those ship in v3.1.
+
+- New **parallel store** at `~/.claude/project-sessions/<project-slug>/` (`index.json`, `meta.json`, future `briefs/`, future `resources/`). Plugin-owned, separate from Claude Code's `~/.claude/projects/` tree. Writes use per-file `os.replace` with `meta.json` as the sentinel; `fsync` before rename; reads tolerate missing files. `~/.claude/projects/` is read-only to the plugin — only the v2 activity-log sidecar lives under it.
+- New **`hooks/segment-normalize`** helper: walks a session's JSONL linearly, computes `project_key` by searching upward up to 4 levels from each message's `cwd` for a project marker (`.git`, `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, `pom.xml`, `*.xcodeproj`), emits segment boundaries on `project_key` changes (not raw `cwd`), collapses 1–2-message blips between same-project neighbors, and upserts each touched project's entry. mtime fast-path short-circuit at entry makes reruns ~1 ms. Darwin-aware case normalization (`os.path.realpath` + `.lower()` for comparison, original case preserved for display).
+- New **Stop-hook incremental normalization**: `hooks.json` now has a second `Stop` entry invoking `segment-normalize` alongside the existing `activity-log stop` entry. Every session close updates the parallel store in-process, fail-silent.
+- New **`/normalize-sessions --migrate`** flag: one-time historical walk of `~/.claude/projects/*/*.jsonl` to backfill the parallel store. Idempotent — re-running is safe and fast because `segment-normalize`'s fast-path skips already-processed files.
+- New **`/normalize-sessions --rebuild <project-slug>`** flag: force re-scan of a single project's segments.
+- New **SessionStart delta-check warning**: if any JSONL under the current slug is newer than the parallel store's last-seen mtime for that session, the hook prepends `⚠ N session(s) pending normalization — run /normalize-sessions --migrate to import` to the output. Detects crash-gap situations where `Stop` didn't fire.
+- Unchanged: v2.1 session-grouped resume dialog, activity log, `/resume-smart`, soft-delete to `.trash/`, Zeus governance, all the v1/v2 cleanup heuristics. The project-first dialog + brief composition ship in v3.1.
+
 ### v2.1.0
 
 - Project-grouped dialog: the startup resume push now lists one row per **project** (not per session), showing `basename(project_key)`, the full path on a sub-row, the latest session's summary, message count, group size (`N sessions`), and the last-actions preview. Primary labels never leak the absolute path; basename collisions disambiguate with a parent-dir hint in square brackets.

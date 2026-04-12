@@ -188,6 +188,52 @@ for idx_file in glob.glob(os.path.join(projects_dir, '*/sessions-index.json')):
     except:
         pass
 
+# --- v3.0 delta-check pre-pass: count sessions pending normalization ---
+# Uses != mtime comparison (never <), per [v3 Zeus #9] clock-skew note.
+pending_normalization = 0
+try:
+    cwd_slug = cwd.replace('/', '-')
+    cwd_proj_dir = os.path.join(projects_dir, cwd_slug)
+    if os.path.isdir(cwd_proj_dir):
+        # Build a union of source_mtimes across every project-sessions meta.json.
+        parallel_store = os.path.join(home, '.claude', 'project-sessions')
+        known_mtimes = {}  # key: '<slug>/<sid>.jsonl' -> set of recorded mtimes
+        if os.path.isdir(parallel_store):
+            for meta_path in glob.glob(os.path.join(parallel_store, '*', 'meta.json')):
+                try:
+                    with open(meta_path) as mf:
+                        meta = json.load(mf)
+                    for k, v in (meta.get('source_mtimes') or {}).items():
+                        known_mtimes.setdefault(k, set()).add(v)
+                except Exception:
+                    continue
+        for jsonl in glob.glob(os.path.join(cwd_proj_dir, '*.jsonl')):
+            try:
+                sid_d = os.path.basename(jsonl).replace('.jsonl', '')
+                cur_mtime = os.path.getmtime(jsonl)
+                key = f'{cwd_slug}/{sid_d}.jsonl'
+                recorded = known_mtimes.get(key) or set()
+                # [v3 Zeus #9]: use != not <, so clock skew triggers at worst a redundant re-scan.
+                def _matches(r, m):
+                    try:
+                        if isinstance(r, (int, float)) and float(r) == m:
+                            return True
+                        if isinstance(r, str):
+                            try:
+                                if float(r) == m:
+                                    return True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    return False
+                if not any(_matches(r, cur_mtime) for r in recorded):
+                    pending_normalization += 1
+            except Exception:
+                continue
+except Exception:
+    pending_normalization = 0
+
 # --- Phase 2: Gather sessions ---
 all_entries = []
 
@@ -352,6 +398,9 @@ def render_rep(rep, label):
 
 # Build output
 lines = []
+# [v3 Zeus #9]: delta-check warning — pending count computed with != mtime comparison.
+if pending_normalization > 0:
+    lines.append(f'\u26a0 {pending_normalization} session(s) pending normalization \u2014 run /normalize-sessions --migrate to import')
 lines.append('--- SESSION NORMALIZER ---')
 
 if deleted > 0:

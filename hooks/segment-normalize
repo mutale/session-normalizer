@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# Session Normalizer — segment-normalize hook
+# Invoked two ways:
+#   1) Stop hook: JSON payload on stdin ({session_id, cwd, ...})
+#   2) CLI helper: segment-normalize --jsonl <absolute-path-to-jsonl>
+#
+# Walks a session JSONL, segments it by project_key (git/toml/etc. marker),
+# and upserts per-project index.json + meta.json under ~/.claude/project-sessions/.
+#
+# [v3 Zeus #1] read-only access to ~/.claude/projects/; writes only to ~/.claude/project-sessions/
+
+ARG1="${1:-}"
+ARG2="${2:-}"
+
+# Save real stdin on fd 3 so the python heredoc doesn't steal it.
+exec 3<&0
+python3 /dev/stdin <<'PY' 3<&3 "$ARG1" "$ARG2"
+import sys, os, json, io
+from datetime import datetime, timezone
+
+DEBUG = os.environ.get('SESSION_NORMALIZER_DEBUG') == '1'
+IS_DARWIN = sys.platform == 'darwin'
+
+HOME = os.path.expanduser('~')
+RAW_PROJECTS_DIR = os.path.join(HOME, '.claude', 'projects')
+STORE_DIR = os.path.join(HOME, '.claude', 'project-sessions')
+
+PROJECT_MARKERS = ('.git', 'package.json', 'Cargo.toml', 'pyproject.toml',
+                   'go.mod', 'pom.xml')
+
+def _warn(msg):
+    if DEBUG:
+        sys.stderr.write(f"[segment-normalize] {msg}\n")
+
+def _bail(msg=''):
+    if msg:
+        _warn(msg)
+    sys.exit(0)
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def _has_marker(d):
+    try:
+        entries = os.listdir(d)
+    except Exception:
+        return False
+    entset = set(entries)
+    for m in PROJECT_MARKERS:
+        if m in entset:
+            return True
+    for e in entries:
+        if e.endswith('.xcodeproj'):
+            full = os.path.join(d, e)
+            if os.path.isdir(full):
+                return True
+    return False
+
+def _find_project_root(cwd):
+    """Walk up to 4 levels from cwd looking for a project marker.
+    Returns (project_root, found_marker_bool)."""
+    cur = cwd
+    for _ in range(4):
+        if _has_marker(cur):
+            return cur, True
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = parent
+    return cwd, False
+
+def _project_key(cwd):
+    """Return (project_key, project_key_cmp, is_generic, is_broken_symlink, project_basename)."""
+    root, found = _find_project_root(cwd)
+    # [v3 Zeus #5] realpath + case fold on Darwin
+    try:
+        real = os.path.realpath(root)
+    except Exception:
+        real = root
+    pk = os.path.normpath(real)
+    pk_cmp = pk.lower() if IS_DARWIN else pk
+    # Genericness
+    is_generic = (not found) or (pk == HOME) or (pk == '/')
+    # Broken symlink check (realpath returns target even if missing)
+    try:
+        is_broken = not os.path.exists(pk)
+    except Exception:
+        is_broken = False
+    basename = os.path.basename(pk) or pk
+    return pk, pk_cmp, is_generic, is_broken, basename
+
+def _extract_user_excerpt(msg):
+    """Extract up to 120 chars of user prompt text from a message.content field."""
+    if msg is None:
+        return ''
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content[:120]
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get('type') == 'text':
+                    t = item.get('text', '')
+                    if isinstance(t, str):
+                        parts.append(t)
+                elif 'text' in item and isinstance(item['text'], str):
+                    parts.append(item['text'])
+            elif isinstance(item, str):
+                parts.append(item)
+        return (' '.join(parts))[:120]
+    return ''
+
+def _atomic_write_json(path, obj):
+    """os.open + os.write + fsync + os.replace — the [v3 Zeus #4] discipline."""
+    data = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        n = 0
+        while n < len(data):
+            w = os.write(fd, data[n:])
+            if w <= 0:
+                raise IOError('short write')
+            n += w
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+def _read_json(path):
+    try:
+        with open(path, 'rb') as f:
+            return json.loads(f.read().decode('utf-8'))
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        _warn(f'read {path} failed: {e}')
+        return None
+
+def _slug_from_cwd(cwd):
+    return cwd.replace('/', '-')
+
+def _parse_args(argv):
+    """argv is [arg1, arg2]. Returns ('jsonl', path) or ('stdin', None)."""
+    if len(argv) >= 2 and argv[0] == '--jsonl' and argv[1]:
+        return ('jsonl', argv[1])
+    return ('stdin', None)
+
+try:
+    argv = sys.argv[1:]
+    mode, jsonl_path = _parse_args(argv)
+
+    if mode == 'jsonl':
+        # Derive session_id from filename; project raw-slug from parent dir name.
+        if not os.path.isabs(jsonl_path):
+            _bail('--jsonl requires absolute path')
+        base = os.path.basename(jsonl_path)
+        if not base.endswith('.jsonl'):
+            _bail(f'not a jsonl file: {base}')
+        sid = base[:-len('.jsonl')]
+        raw_slug = os.path.basename(os.path.dirname(jsonl_path))
+    else:
+        try:
+            raw = os.read(3, 1 << 20).decode('utf-8', errors='replace')
+        except Exception:
+            raw = ''
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except Exception as e:
+            _bail(f'stdin not json: {e}')
+        sid = payload.get('session_id')
+        cwd0 = payload.get('cwd')
+        if not sid or not cwd0:
+            _bail('missing session_id or cwd')
+        raw_slug = _slug_from_cwd(cwd0)
+        jsonl_path = os.path.join(RAW_PROJECTS_DIR, raw_slug, f'{sid}.jsonl')
+
+    # Stat the JSONL (read-only touch)
+    try:
+        st = os.stat(jsonl_path)
+    except Exception as e:
+        _bail(f'jsonl stat failed: {e}')
+    src_mtime = st.st_mtime
+    src_rel = f'{raw_slug}/{sid}.jsonl'
+
+    # ---- Walk the JSONL ----
+    segments = []  # list of dicts
+    cur = None
+    project_cache = {}  # cwd -> (pk, pk_cmp, is_generic, is_broken, basename)
+    msg_idx = -1
+
+    def _project_for(cwd):
+        if cwd in project_cache:
+            return project_cache[cwd]
+        v = _project_key(cwd)
+        project_cache[cwd] = v
+        return v
+
+    try:
+        fh = open(jsonl_path, 'rb')
+    except Exception as e:
+        _bail(f'open jsonl failed: {e}')
+
+    try:
+        for raw_line in fh:
+            msg_idx += 1
+            try:
+                entry = json.loads(raw_line.decode('utf-8', errors='replace'))
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            cwd_e = entry.get('cwd')
+            if not cwd_e or not isinstance(cwd_e, str):
+                continue
+            ts = entry.get('timestamp') or ''
+            etype = entry.get('type') or ''
+            pk, pk_cmp, is_gen, is_broken, basename = _project_for(cwd_e)
+
+            user_excerpt = ''
+            if etype == 'user':
+                msg = entry.get('message')
+                user_excerpt = _extract_user_excerpt(msg)
+
+            if cur is None or cur['project_key'] != pk:
+                # Close prior segment
+                if cur is not None:
+                    segments.append(cur)
+                cur = {
+                    'session_id': sid,
+                    'project_key': pk,
+                    'project_key_cmp': pk_cmp,
+                    'project_basename': basename,
+                    'cwd_raw': cwd_e,
+                    'is_generic': is_gen,
+                    'is_broken_symlink': is_broken,
+                    'first_msg_idx': msg_idx,
+                    'last_msg_idx': msg_idx,
+                    'msg_count': 1,
+                    'first_ts': ts,
+                    'last_ts': ts,
+                    'first_user_prompt': user_excerpt,
+                }
+            else:
+                cur['last_msg_idx'] = msg_idx
+                cur['msg_count'] += 1
+                if ts:
+                    cur['last_ts'] = ts
+                if not cur['first_user_prompt'] and user_excerpt:
+                    cur['first_user_prompt'] = user_excerpt
+        if cur is not None:
+            segments.append(cur)
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+    if not segments:
+        _bail('no segments')
+
+    # ---- [v3 Zeus #2] Blip-segment collapse ----
+    # If a segment has msg_count<3 sandwiched between two segs sharing same
+    # project_key_cmp, merge it into the chronologically prior segment.
+    ELIDED_NOTE = ' (brief cd-blip elided)'
+    i = 1
+    while i < len(segments) - 1:
+        s = segments[i]
+        prev = segments[i - 1]
+        nxt = segments[i + 1]
+        if (s['msg_count'] < 3
+                and prev['project_key_cmp'] == nxt['project_key_cmp']
+                and s['project_key_cmp'] != prev['project_key_cmp']):
+            # Merge blip into prev
+            prev['last_msg_idx'] = s['last_msg_idx']
+            prev['msg_count'] += s['msg_count']
+            if s['last_ts']:
+                prev['last_ts'] = s['last_ts']
+            if not prev['first_user_prompt'].endswith(ELIDED_NOTE):
+                prev['first_user_prompt'] = prev['first_user_prompt'] + ELIDED_NOTE
+            # Remove the blip
+            del segments[i]
+            # Do NOT advance — next iteration re-examines same index
+            # (now points to what was segments[i+1]); but we may be able to
+            # merge the following segment with prev if they share key.
+            if i < len(segments) and segments[i]['project_key_cmp'] == prev['project_key_cmp']:
+                nxt2 = segments[i]
+                prev['last_msg_idx'] = nxt2['last_msg_idx']
+                prev['msg_count'] += nxt2['msg_count']
+                if nxt2['last_ts']:
+                    prev['last_ts'] = nxt2['last_ts']
+                del segments[i]
+            continue
+        i += 1
+
+    # ---- Group segments by project_key ----
+    by_project = {}
+    for s in segments:
+        by_project.setdefault(s['project_key'], []).append(s)
+
+    # ---- [v3 Zeus #3] Fast-path short-circuit ----
+    # For each touched project, check meta.json source_mtimes == src_mtime.
+    # If ALL are up to date, exit 0 with no writes.
+    def _project_slug(project_key, project_key_cmp, is_generic):
+        # [v3 Zeus #10] GENERIC cannot collide — literal string
+        if is_generic:
+            return 'GENERIC'
+        key = project_key_cmp if IS_DARWIN else project_key
+        return key.replace('/', '-').lstrip('-')
+
+    project_dirs = {}  # project_key -> (slug, target_dir)
+    all_fresh = True
+    for pk, segs in by_project.items():
+        is_gen = segs[0]['is_generic']
+        pk_cmp = segs[0]['project_key_cmp']
+        slug = _project_slug(pk, pk_cmp, is_gen)
+        tdir = os.path.join(STORE_DIR, slug)
+        project_dirs[pk] = (slug, tdir)
+        meta = _read_json(os.path.join(tdir, 'meta.json'))
+        idx = _read_json(os.path.join(tdir, 'index.json'))
+        # Require BOTH meta.json present and index.json present for fast-path —
+        # meta.json is the sentinel ([v3 Zeus #4]); missing index means half-written.
+        if not meta or not idx:
+            all_fresh = False
+            continue
+        src_mtimes = meta.get('source_mtimes') or {}
+        existing = src_mtimes.get(src_rel)
+        # [v3 Zeus #9] exact equality, not < (clock-skew note)
+        if existing != src_mtime:
+            all_fresh = False
+
+    if all_fresh:
+        sys.exit(0)
+
+    # ---- Upsert per-project ----
+    now_iso = _now_iso()
+    for pk, segs in by_project.items():
+        try:
+            slug, tdir = project_dirs[pk]
+            os.makedirs(tdir, exist_ok=True)
+
+            idx_path = os.path.join(tdir, 'index.json')
+            meta_path = os.path.join(tdir, 'meta.json')
+
+            existing_idx = _read_json(idx_path) or {}
+            existing_segs = existing_idx.get('segments') or []
+            is_gen = segs[0]['is_generic']
+            basename = segs[0]['project_basename']
+
+            # Dedup: drop any existing segments matching (session_id, first_msg_idx)
+            # of the segments we're re-emitting.
+            new_keys = {(s['session_id'], s['first_msg_idx']) for s in segs}
+            kept = [e for e in existing_segs
+                    if (e.get('session_id'), e.get('first_msg_idx')) not in new_keys]
+
+            # Serialize new segments (drop internal-only project_key_cmp field)
+            serialized = []
+            for s in segs:
+                out = {
+                    'session_id': s['session_id'],
+                    'cwd_raw': s['cwd_raw'],
+                    'first_msg_idx': s['first_msg_idx'],
+                    'last_msg_idx': s['last_msg_idx'],
+                    'msg_count': s['msg_count'],
+                    'first_ts': s['first_ts'],
+                    'last_ts': s['last_ts'],
+                    'first_user_prompt': s['first_user_prompt'],
+                }
+                if s['is_broken_symlink']:
+                    out['is_broken_symlink'] = True
+                serialized.append(out)
+
+            merged = kept + serialized
+            total_msgs = sum(int(e.get('msg_count') or 0) for e in merged)
+            total_sessions = len({e.get('session_id') for e in merged if e.get('session_id')})
+
+            idx_obj = {
+                'version': 1,
+                'project_key': pk,
+                'project_basename': basename,
+                'is_generic': bool(is_gen),
+                'last_updated': now_iso,
+                'segments': merged,
+                'total_msgs': total_msgs,
+                'total_sessions': total_sessions,
+            }
+
+            # index.json first
+            _atomic_write_json(idx_path, idx_obj)
+
+            # meta.json sentinel — LAST
+            existing_meta = _read_json(meta_path) or {}
+            src_mtimes = dict(existing_meta.get('source_mtimes') or {})
+            src_mtimes[src_rel] = src_mtime
+            meta_obj = {
+                'version': 1,
+                'schema_built_at': existing_meta.get('schema_built_at') or now_iso,
+                'source_mtimes': src_mtimes,
+                'archive_ptr': existing_meta.get('archive_ptr'),
+            }
+            _atomic_write_json(meta_path, meta_obj)
+        except Exception as e:
+            _warn(f'upsert {pk} failed: {e}')
+            continue
+
+    sys.exit(0)
+
+except SystemExit:
+    raise
+except Exception as e:
+    _warn(f'unhandled: {e}')
+    sys.exit(0)
+PY
+
+exit 0

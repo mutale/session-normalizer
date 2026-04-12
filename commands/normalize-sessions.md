@@ -5,6 +5,25 @@ description: Project-grouped, resume-first session normalization (v2.1). Groups 
 
 # Normalize Sessions (v2.1 — Project-Grouped Resume-First)
 
+## Modes
+
+This command has three modes:
+
+1. **`/normalize-sessions --migrate`** — one-time historical backfill of the parallel store. Instructions:
+   - Enumerate every `*.jsonl` under `~/.claude/projects/*/`.
+   - For each, invoke `segment-normalize --jsonl <absolute-path>` (via the Bash tool, calling `${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd segment-normalize --jsonl <abs-path>`).
+   - Count files processed, segments emitted (parse `segment-normalize` stderr under `SESSION_NORMALIZER_DEBUG=1`), and projects touched.
+   - Print progress every 10 files.
+   - Idempotent: files whose mtime already matches `meta.json.source_mtimes` are fast-path skipped by `segment-normalize` itself.
+   - End with a summary: `Migrated N sessions into M projects, parallel store size: K`.
+
+2. **`/normalize-sessions --rebuild <project-slug>`** — force re-scan of one project.
+   - Locate `~/.claude/project-sessions/<project-slug>/meta.json`, read its `source_mtimes`.
+   - For each JSONL listed there, clear the entry and invoke `segment-normalize --jsonl <abs-path>`.
+   - Useful when you suspect a project's index is stale or corrupt.
+
+3. **`/normalize-sessions`** (no flags) — interactive cleanup (existing v2.1 flow, unchanged). See below.
+
 You are running session normalization. Semantics: group every scanned session by its `project_key`, ask the user which **project** to resume, then (if that project has >1 session) which **session** within it, then delegate the actual resume UX to the `session-manager` skill. Every *other* session in the picked project is summarized into that project's `docs/SESSION-HISTORY.md` and soft-deleted into `.trash/`. Sessions in OTHER projects are never touched by this command, even if the legacy cwd-child/parent predicate would have matched them. Nothing is ever hard-deleted.
 
 ## Definitions
