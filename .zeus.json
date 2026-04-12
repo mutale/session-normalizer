@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "tier": "production",
+  "triggers": {
+    "plan_creation": true,
+    "implementation_start": true,
+    "pre_commit": true
+  }
+}

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Session Normalizer — activity-log hook
+# Appends one JSON line per event to ~/.claude/projects/<slug>/<sid>.activity.jsonl
+# Invoked as: run-hook.cmd activity-log <kind>   (kind ∈ prompt|tool|stop)
+# Stdin: Claude Code hook JSON payload.
+
+KIND="${1:-}"
+
+# Save real stdin on fd 3 so the python heredoc doesn't steal it.
+exec 3<&0
+python3 /dev/stdin <<PY 3<&3
+import sys, os, json, io
+from datetime import datetime, timezone
+
+DEBUG = os.environ.get('SESSION_NORMALIZER_DEBUG') == '1'
+
+def _warn(msg):
+    if DEBUG:
+        sys.stderr.write(f"[activity-log] {msg}\n")
+
+def _bail(msg=''):
+    if msg:
+        _warn(msg)
+    sys.exit(0)
+
+try:
+    kind = "${KIND}"
+    if kind not in ('prompt', 'tool', 'stop'):
+        _bail(f'bad kind: {kind!r}')
+
+    try:
+        raw = os.read(3, 1 << 20).decode('utf-8', errors='replace')
+    except Exception:
+        raw = ''
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception as e:
+        _bail(f'stdin not json: {e}')
+
+    sid = payload.get('session_id')
+    cwd = payload.get('cwd')
+    if not sid or not cwd:
+        _bail('missing session_id or cwd')
+
+    # Slug: replace ALL '/' with '-' — never basename.
+    slug = cwd.replace('/', '-')
+
+    projects_dir = os.path.join(os.path.expanduser('~'), '.claude', 'projects', slug)
+    try:
+        os.makedirs(projects_dir, exist_ok=True)
+    except Exception as e:
+        _bail(f'mkdir failed: {e}')
+
+    path = os.path.join(projects_dir, f'{sid}.activity.jsonl')
+
+    # Build event
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    ev = {'t': ts, 'k': kind}
+
+    if kind == 'prompt':
+        p = payload.get('prompt', '')
+        if not isinstance(p, str):
+            p = ''
+        # 80-char cap on prompt text
+        ev['p'] = p[:80]
+    elif kind == 'tool':
+        tool_name = payload.get('tool_name', '') or ''
+        tool_input = payload.get('tool_input') or {}
+        tool_response = payload.get('tool_response') or {}
+        ev['n'] = tool_name
+
+        arg = ''
+        if tool_name in ('Write', 'Edit', 'Read', 'NotebookEdit'):
+            arg = tool_input.get('file_path', '') or ''
+        elif tool_name in ('Task', 'Agent'):
+            arg = tool_input.get('description', '') or ''
+        elif tool_name == 'Bash':
+            cmd = tool_input.get('command', '') or ''
+            # FIRST whitespace token only — Bash-first-token rule
+            arg = cmd.split()[0] if cmd.split() else ''
+        elif tool_name in ('Grep', 'Glob'):
+            arg = tool_input.get('pattern', '') or ''
+        if not isinstance(arg, str):
+            arg = str(arg)
+        ev['a'] = arg
+
+        status = 'ok'
+        if isinstance(tool_response, dict):
+            s = tool_response.get('status')
+            if isinstance(s, str) and s:
+                status = s
+        ev['s'] = status
+    # stop: nothing extra
+
+    line = json.dumps(ev, separators=(',', ':'), ensure_ascii=False) + '\n'
+    data = line.encode('utf-8', errors='replace')
+
+    # Hard cap 1024 bytes including trailing newline; ensure valid JSON terminator.
+    if len(data) > 1024:
+        data = data[:1024]
+        # Replace final 2 bytes with "}\n" so the line still parses.
+        data = data[:-2] + b'}\n'
+
+    # Rotation: best-effort, swallow all errors.
+    try:
+        st = os.stat(path)
+        if st.st_size > 65536:
+            try:
+                with open(path, 'rb') as f:
+                    lines = f.readlines()
+                keep = lines[-500:]
+                tmp = path + '.tmp'
+                with open(tmp, 'wb') as f:
+                    f.writelines(keep)
+                os.replace(tmp, path)
+            except Exception as e:
+                _warn(f'rotation failed: {e}')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        _warn(f'stat failed: {e}')
+
+    # Single write(2) append — no buffered open, no fsync.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except Exception as e:
+        _bail(f'write failed: {e}')
+
+except SystemExit:
+    raise
+except Exception as e:
+    _warn(f'unhandled: {e}')
+    sys.exit(0)
+PY
+
+exit 0

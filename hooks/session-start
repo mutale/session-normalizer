@@ -15,12 +15,98 @@ fi
 
 # Run cleanup + session listing via python3
 OUTPUT=$(python3 -c "
-import json, os, glob, shutil
+import json, os, glob, shutil, time
 from datetime import datetime
 
 projects_dir = os.path.expanduser('$PROJECTS_DIR')
 cwd = '''$CWD'''
 home = os.path.expanduser('~')
+
+def read_activity_tail(path, n=20):
+    # Returns (events_list, mtime, last_raw_line_is_parseable)
+    # Tolerates trailing partial/garbage line on LAST line only.
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return [], 0.0
+        mtime = os.path.getmtime(path)
+        with open(path, 'rb') as f:
+            data = f.read()
+        lines = data.decode('utf-8', errors='replace').splitlines()
+        tail = lines[-n:] if len(lines) > n else lines
+        events = []
+        last_idx = len(tail) - 1
+        for i, line in enumerate(tail):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Trailing partial line is tolerated silently; earlier broken lines also skipped.
+                if i == last_idx:
+                    continue
+                continue
+            except Exception:
+                continue
+        return events, mtime
+    except Exception:
+        return [], 0.0
+
+def format_event(ev):
+    k = ev.get('k', '')
+    if k == 'tool':
+        name = ev.get('name', '?')
+        target = ev.get('target', '') or ''
+        if target:
+            return f'{name} {target}'
+        return name
+    if k == 'prompt':
+        return 'prompt ' + (ev.get('text', '') or '')[:20]
+    if k == 'agent':
+        return 'Task ' + (ev.get('desc', '') or '')[:20]
+    if k == 'stop':
+        return 'stop'
+    return k or '?'
+
+def build_last_actions(events):
+    # Pick up to 4 recent events, prefer 'tool' kinds.
+    if not events:
+        return ''
+    tools = [e for e in events if e.get('k') == 'tool']
+    pool = tools if len(tools) >= 2 else events
+    picked = pool[-4:]
+    parts = [format_event(e) for e in picked if format_event(e)]
+    line = ' \u00b7 '.join(parts)
+    if len(line) > 80:
+        line = line[:79] + '\u2026'
+    return line
+
+def activity_log_path(sid, session_cwd):
+    # Slug convention: cwd.replace('/', '-'), matches Claude Code projects layout.
+    if not session_cwd:
+        return ''
+    slug = session_cwd.replace('/', '-')
+    return os.path.join(projects_dir, slug, f'{sid}.activity.jsonl')
+
+def activity_has_meaningful_entry(path):
+    # True if log exists and has >=1 parseable line whose k is in {tool, prompt}.
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get('k') in ('tool', 'prompt'):
+                    return True
+        return False
+    except Exception:
+        return False
 
 # --- Phase 1: Auto-delete junk sessions ---
 deleted = 0
@@ -70,6 +156,15 @@ for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
     ):
         delete = True
 
+    # Junk-deletion guard: if an activity log has real tool/prompt entries,
+    # override delete (crashed before first user prompt was persisted).
+    if delete:
+        sid_guard = os.path.basename(jsonl).replace('.jsonl', '')
+        slug_dir = os.path.basename(os.path.dirname(jsonl))
+        act_path = os.path.join(projects_dir, slug_dir, f'{sid_guard}.activity.jsonl')
+        if activity_has_meaningful_entry(act_path):
+            delete = False
+
     if delete:
         try:
             os.remove(jsonl)
@@ -114,7 +209,7 @@ for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
         continue
     msg_count = 0
     first_prompt = ''
-    session_cwd = ''
+    project_key = ''
     try:
         with open(jsonl) as f:
             for line in f:
@@ -126,8 +221,11 @@ for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
                             c = d.get('message', {}).get('content', '')
                             if isinstance(c, str):
                                 first_prompt = c[:60]
-                        if not session_cwd:
-                            session_cwd = d.get('cwd', '')
+                        # project_key = FIRST non-empty cwd seen (v2.1 Zeus #1)
+                        if not project_key:
+                            c_cwd = d.get('cwd', '')
+                            if c_cwd:
+                                project_key = c_cwd
                 except:
                     pass
     except:
@@ -138,7 +236,7 @@ for jsonl in glob.glob(os.path.join(projects_dir, '*/*.jsonl')):
             'summary': first_prompt or 'Untitled',
             'messageCount': msg_count,
             'modified': '',
-            'projectPath': session_cwd or '',
+            'projectPath': project_key or '',
         })
 
 if not all_entries and deleted == 0:
@@ -147,17 +245,70 @@ if not all_entries and deleted == 0:
 # Sort by modified date
 all_entries.sort(key=lambda e: e.get('modified', '') or '0', reverse=True)
 
-# Separate matching vs other
-matching = []
-others = []
 project_name = os.path.basename(cwd)
+now_ts = time.time()
 
+# --- v2.1: Group by project_key ---
+projects = {}
 for e in all_entries:
-    proj = e.get('projectPath', '')
-    summary = e.get('summary', 'Untitled')
-    sid = e.get('sessionId', '')
-    modified = e.get('modified', '')
-    count = e.get('messageCount', 0)
+    pk = e.get('projectPath', '') or ''
+    projects.setdefault(pk, []).append(e)
+
+def rep_sort_key(entry):
+    m = entry.get('modified', '') or ''
+    return (m, entry.get('messageCount', 0))
+
+reps = []
+for pk, sessions in projects.items():
+    # Representative = highest mtime; fall back to highest msg_count if all empty
+    rep = max(sessions, key=rep_sort_key)
+    rep = dict(rep)
+    rep['project_key'] = pk
+    rep['group_size'] = len(sessions)
+    reps.append(rep)
+
+# Re-sort reps by their modified date, desc
+reps.sort(key=lambda r: r.get('modified', '') or '0', reverse=True)
+
+# Split matching vs others using the existing predicate on rep's project_key
+matching_reps = []
+others_reps = []
+for rep in reps:
+    proj = rep.get('project_key', '')
+    if proj == cwd:
+        matching_reps.append(rep)
+    elif proj and proj.startswith(cwd + '/'):
+        matching_reps.append(rep)
+    elif proj and cwd.startswith(proj + '/') and proj != home:
+        matching_reps.append(rep)
+    else:
+        others_reps.append(rep)
+
+# --- Basename collision disambiguation within a bucket ---
+def disambiguate(bucket):
+    labels = {}
+    seen = {}
+    for r in bucket:
+        pk = r.get('project_key', '') or ''
+        base = os.path.basename(pk) or '(root)'
+        seen.setdefault(base, []).append(r)
+    for base, group in seen.items():
+        if len(group) == 1:
+            labels[id(group[0])] = base
+        else:
+            for r in group:
+                pk = r.get('project_key', '') or ''
+                parent = os.path.basename(os.path.dirname(pk)) or '/'
+                labels[id(r)] = f'{base} [{parent}]'
+    return labels
+
+def render_rep(rep, label):
+    summary = rep.get('summary', 'Untitled') or 'Untitled'
+    sid = rep.get('sessionId', '')
+    modified = rep.get('modified', '')
+    count = rep.get('messageCount', 0)
+    group_size = rep.get('group_size', 1)
+    proj = rep.get('project_key', '') or ''
 
     try:
         dt = datetime.fromisoformat(modified.replace('Z', '+00:00'))
@@ -168,17 +319,36 @@ for e in all_entries:
     if len(summary) > 55:
         summary = summary[:52] + '...'
 
-    entry = f'  {summary} | {date_str} | {count} msgs | {sid}'
+    # Activity log: tail, unfinished marker, last-actions preview
+    act_path = activity_log_path(sid, proj)
+    events, act_mtime = read_activity_tail(act_path, n=20) if act_path else ([], 0.0)
+    unfinished = False
+    if act_path and os.path.exists(act_path) and os.path.getsize(act_path) > 0:
+        if (now_ts - act_mtime) > 120:
+            last_k = None
+            for ev in reversed(events):
+                if isinstance(ev, dict) and 'k' in ev:
+                    last_k = ev.get('k')
+                    break
+            if last_k != 'stop':
+                unfinished = True
 
-    # Match: exact, child, or specific parent (not home)
-    if proj == cwd:
-        matching.append(entry)
-    elif proj.startswith(cwd + '/'):
-        matching.append(entry)
-    elif cwd.startswith(proj + '/') and proj != home:
-        matching.append(entry)
-    elif len(others) < 5:
-        others.append(entry)
+    prefix = '\u26a0 unfinished ' if unfinished else ''
+    out_lines = []
+    out_lines.append(f'  {prefix}{label} \u2014 {summary} | {date_str} | {count} msgs | {group_size} sessions | {sid}')
+
+    proj_disp = proj if proj else '(unknown)'
+    sub_parts = [f'path: {proj_disp}']
+    if events:
+        preview = build_last_actions(events)
+        if preview:
+            sub_parts.append(f'last: {preview}')
+    out_lines.append('    ' + '   '.join(sub_parts))
+
+    if group_size > 1:
+        out_lines.append(f'    ({group_size} sessions \u2014 consider merging with /normalize-sessions)')
+
+    return out_lines
 
 # Build output
 lines = []
@@ -189,22 +359,31 @@ if deleted > 0:
 
 lines.append('')
 
-if matching:
+if matching_reps:
     lines.append(f'Sessions in this project ({project_name}):')
-    for m in matching[:5]:
-        lines.append(m)
-    if len(matching) > 1:
-        lines.append(f'  ({len(matching)} sessions — consider merging with /normalize-sessions)')
+    capped = matching_reps[:5]
+    labels = disambiguate(capped)
+    for rep in capped:
+        lines.extend(render_rep(rep, labels[id(rep)]))
     lines.append('')
 
-if others:
-    lines.append('Other recent sessions:')
-    for o in others[:3]:
-        lines.append(o)
+if others_reps:
+    lines.append('Other recent projects:')
+    capped_o = others_reps[:5]
+    labels_o = disambiguate(capped_o)
+    for rep in capped_o:
+        lines.extend(render_rep(rep, labels_o[id(rep)]))
     lines.append('')
 
 lines.append('To resume: /resume')
 lines.append('To merge old sessions: /normalize-sessions')
+lines.append('')
+lines.append('SESSION NORMALIZER — ACTION REQUIRED (as your first user-facing action,')
+lines.append('after any mandatory skill bootstrapping such as using-superpowers):')
+lines.append('call AskUserQuestion with the session list above and ask which to')
+lines.append('resume (or start fresh). Do this BEFORE addressing the user\\'s first')
+lines.append('prompt as a normal task. If a superpowers skill requires invocation')
+lines.append('first, run it, then immediately proceed to the AskUserQuestion call.')
 
 print('\\n'.join(lines))
 " 2>/dev/null)

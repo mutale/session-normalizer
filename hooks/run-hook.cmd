@@ -3,6 +3,10 @@
 REM Cross-platform polyglot wrapper for hook scripts.
 REM On Windows: cmd.exe runs the batch portion, which finds and calls bash.
 REM On Unix: the shell interprets this as a script (: is a no-op in bash).
+REM
+REM Contract: this wrapper accepts a script-name as %1 followed by up to
+REM 8 token args (%2..%9). Forwarded args are quoted with "%~N" so tokens
+REM containing spaces or shell-metacharacters survive the batch->bash hop.
 
 if "%~1"=="" (
     echo run-hook.cmd: missing script name >&2
@@ -12,17 +16,17 @@ if "%~1"=="" (
 set "HOOK_DIR=%~dp0"
 
 if exist "C:\Program Files\Git\bin\bash.exe" (
-    "C:\Program Files\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
+    "C:\Program Files\Git\bin\bash.exe" "%HOOK_DIR%%~1" "%~2" "%~3" "%~4" "%~5" "%~6" "%~7" "%~8" "%~9"
     exit /b %ERRORLEVEL%
 )
 if exist "C:\Program Files (x86)\Git\bin\bash.exe" (
-    "C:\Program Files (x86)\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
+    "C:\Program Files (x86)\Git\bin\bash.exe" "%HOOK_DIR%%~1" "%~2" "%~3" "%~4" "%~5" "%~6" "%~7" "%~8" "%~9"
     exit /b %ERRORLEVEL%
 )
 
 where bash >nul 2>nul
 if %ERRORLEVEL% equ 0 (
-    bash "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
+    bash "%HOOK_DIR%%~1" "%~2" "%~3" "%~4" "%~5" "%~6" "%~7" "%~8" "%~9"
     exit /b %ERRORLEVEL%
 )
 

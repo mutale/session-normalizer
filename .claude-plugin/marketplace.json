@@ -2,15 +2,15 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "session-normalizer-local",
   "description": "Local marketplace for session-normalizer plugin",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "owner": {
     "name": "Yehuda"
   },
   "plugins": [
     {
       "name": "session-normalizer",
-      "description": "Auto-cleanup junk sessions, show project-relevant sessions on startup, merge old sessions into docs",
-      "version": "1.0.0",
+      "description": "Session cleanup, push-on-start resume dialog, crash-safe activity log, and resume-and-merge-others flow for Claude Code",
+      "version": "2.1.0",
       "source": "./"
     }
   ]
