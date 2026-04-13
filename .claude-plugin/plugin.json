@@ -1,7 +1,7 @@
 {
   "name": "session-normalizer",
   "description": "Session cleanup, push-on-start resume dialog, crash-safe activity log, and resume-and-merge-others flow for Claude Code",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "author": {
     "name": "Yehuda"
   },

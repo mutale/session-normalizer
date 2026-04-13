@@ -93,6 +93,19 @@ Works on macOS, Linux, and Windows (via Git Bash). No external dependencies beyo
 
 ## Changelog
 
+### v3.1.0 — history drain, background migration, drain-on-start fallback
+
+v3.1.0 is the **infrastructure half** of the v3.1 redesign. User-facing UX changes (project guess + offer card + memory-load framing) ship in v3.1.1 on top of this proven base.
+
+- **New `history.jsonl` per project** in the parallel store (`~/.claude/project-sessions/<project-slug>/history.jsonl`). Append-only JSONL carrying the actual turn text from every drained session — user prompts capped at 2 KB, assistant turns at 8 KB (preserves inline text between tool calls; strips thinking blocks and base64 images). Written via the same single-`write(2)` + `O_APPEND` discipline as the v2 activity log.
+- **Stop-hook now drains text**, not just metadata. `segment-normalize` walks the just-ended session's JSONL a second time after boundary detection, extracts per-turn `{role, text, tools}` records, and appends them to the target project's `history.jsonl`. On successful drain, the raw JSONL is soft-deleted into `~/.claude/projects/<slug>/.trash/<ts>-<sid>/` (30-day grace window). Skipped if any drain step errors, if the JSONL was touched within the last 60 s (active session), or if the soft-delete target already exists.
+- **`project.json` per project** carrying `project_key`, `project_basename`, `last_session_name` (read from `~/.claude/sessions/*.json`), `last_active`, and `session_names_seen`. Populated on every drain. `color` field is reserved but always `null` because Claude Code does not persist session color.
+- **`meta.json.history_drained` fast-path guard.** v3.0's mtime fast-path is now combined: a session is skipped only if `source_mtimes[src_rel] == src_mtime` AND `history_drained[src_rel] == true`. Existing v3.0 entries automatically re-walk on first v3.1.0 run to populate their history.
+- **Background migration daemon.** On first SessionStart after v3.1.0 installs, the hook forks a fully-detached background process (double-fork + setsid + SIGHUP ignore + stdio redirected to `.migration.log`) that walks `~/.claude/projects/*/*.jsonl` and invokes `segment-normalize --jsonl` per file. Completes in the background without blocking the user. Writes `.migration-v3.1-done` sentinel on clean exit; stale `.migration-v3.1-running` sentinels older than 10 minutes trigger a re-launch on next SessionStart.
+- **Drain-on-start fallback for unclean exits.** If `Stop` did not fire (system shutdown, power loss, SIGKILL), the next SessionStart runs the drain **synchronously** (up to a 10-second budget) for any raw JSONL lacking a recorded drain — not just warn. Closes the crash-gap that otherwise breaks the "ephemeral raw, canonical store" promise.
+- **Per-project `.drain.lock`** at `~/.claude/project-sessions/<slug>/.drain.lock`. Prevents SessionStart's drain-on-start from racing a live Stop-hook drain. SessionStart polls up to 2000 ms with 50 ms intervals; stale PIDs are considered released.
+- **UX unchanged.** SessionStart still shows the v2.1 project-grouped dialog. v3.1.1 will replace it with the project-guess + offer-card memory-load flow.
+
 ### v3.0.0 — infrastructure for project-first model
 
 v3.0 is the **infrastructure batch** of the v3 redesign. No user-facing UX changes yet; those ship in v3.1.

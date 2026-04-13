@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Session Normalizer v3.1 — background historical migrator.
+# Launched daemonized from hooks/session-start ([v3.1 Zeus #3]).
+# Walks every ~/.claude/projects/*/*.jsonl and invokes segment-normalize on each.
+# stdout/stderr are already routed to ~/.claude/project-sessions/.migration.log by the daemon parent.
+
+set -u
+
+exec python3 - <<'PYEOF'
+import os, sys, glob, subprocess, time
+
+# The daemon parent closed fds 0/1/2 and reopened them via os.dup2, but
+# python's sys.stdout/sys.stderr may be None under `python3 -` with heredoc.
+# Re-bind them directly to the underlying fds (1 and 2 point at .migration.log).
+try:
+    if sys.stdout is None:
+        sys.stdout = os.fdopen(1, 'w', buffering=1)
+    if sys.stderr is None:
+        sys.stderr = os.fdopen(2, 'w', buffering=1)
+except Exception:
+    pass
+
+home = os.path.expanduser('~')
+projects_dir = os.path.join(home, '.claude', 'projects')
+store_dir = os.path.join(home, '.claude', 'project-sessions')
+running_sentinel = os.path.join(store_dir, '.migration-v3.1-running')
+done_sentinel = os.path.join(store_dir, '.migration-v3.1-done')
+
+# Prefer explicit plugin root; otherwise compute from this script's path.
+plugin_root = os.environ.get('CLAUDE_PLUGIN_ROOT') or os.path.join(
+    home, '.claude', 'plugins', 'marketplaces', 'session-normalizer-local'
+)
+run_hook = os.path.join(plugin_root, 'hooks', 'run-hook.cmd')
+
+_log_path_fallback = os.path.join(home, '.claude', 'project-sessions', '.migration.log')
+def log(msg):
+    line = f'[{time.strftime("%Y-%m-%dT%H:%M:%S")}] {msg}\n'
+    wrote = False
+    try:
+        os.write(1, line.encode('utf-8', 'replace'))
+        wrote = True
+    except Exception:
+        pass
+    if not wrote:
+        try:
+            with open(_log_path_fallback, 'a') as _lf:
+                _lf.write(line)
+        except Exception:
+            pass
+
+try:
+    log('migrate-v3_1 start')
+    if not os.path.isdir(projects_dir):
+        log('no projects dir; nothing to do')
+    elif not os.path.exists(run_hook):
+        log(f'run-hook.cmd missing at {run_hook}; aborting')
+        sys.exit(1)
+    else:
+        total = 0
+        ok = 0
+        fail = 0
+        for jsonl in glob.glob(os.path.join(projects_dir, '*', '*.jsonl')):
+            # Skip activity logs.
+            if jsonl.endswith('.activity.jsonl'):
+                continue
+            # Skip anything inside a sidecar <sid>/ subdir — we only want top-level JSONLs.
+            parent = os.path.basename(os.path.dirname(jsonl))
+            # Sidecar detection: its parent dir name is a valid <sid>-like dir, i.e. it itself
+            # sits two levels deep under projects_dir. projects/<slug>/<file>.jsonl has depth 1.
+            rel = os.path.relpath(jsonl, projects_dir)
+            if rel.count(os.sep) != 1:
+                continue
+            total += 1
+            try:
+                rc = subprocess.run(
+                    ['bash', run_hook, 'segment-normalize', '--jsonl', jsonl],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=120,
+                ).returncode
+                if rc == 0:
+                    ok += 1
+                    log(f'ok  {rel}')
+                else:
+                    fail += 1
+                    log(f'err rc={rc} {rel}')
+            except subprocess.TimeoutExpired:
+                fail += 1
+                log(f'timeout {rel}')
+            except Exception as e:
+                fail += 1
+                log(f'exc {rel}: {e!r}')
+        log(f'migrate-v3_1 done: total={total} ok={ok} fail={fail}')
+
+    # Write done sentinel with timestamp.
+    try:
+        os.makedirs(store_dir, exist_ok=True)
+        with open(done_sentinel, 'w') as f:
+            f.write(time.strftime('%Y-%m-%dT%H:%M:%S') + '\n')
+    except Exception as e:
+        log(f'could not write done sentinel: {e!r}')
+finally:
+    # Remove running sentinel regardless of outcome.
+    try:
+        if os.path.exists(running_sentinel):
+            os.remove(running_sentinel)
+    except Exception:
+        pass
+PYEOF

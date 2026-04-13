@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Session Normalizer — segment-normalize hook
+# Session Normalizer - segment-normalize hook
 # Invoked two ways:
 #   1) Stop hook: JSON payload on stdin ({session_id, cwd, ...})
 #   2) CLI helper: segment-normalize --jsonl <absolute-path-to-jsonl>
 #
 # Walks a session JSONL, segments it by project_key (git/toml/etc. marker),
 # and upserts per-project index.json + meta.json under ~/.claude/project-sessions/.
+# v3.1.0 extension: second-pass text drain -> history.jsonl, project.json
+# population, per-project drain lock, soft-delete of raw JSONL.
 #
-# [v3 Zeus #1] read-only access to ~/.claude/projects/; writes only to ~/.claude/project-sessions/
+# [v3 Zeus #1] read-only access to ~/.claude/projects/; writes only to
+# ~/.claude/project-sessions/ (except the v3.1 soft-delete mv of the raw JSONL).
 
 ARG1="${1:-}"
 ARG2="${2:-}"
@@ -15,7 +18,7 @@ ARG2="${2:-}"
 # Save real stdin on fd 3 so the python heredoc doesn't steal it.
 exec 3<&0
 python3 /dev/stdin <<'PY' 3<&3 "$ARG1" "$ARG2"
-import sys, os, json, io
+import sys, os, json, io, shutil, errno
 from datetime import datetime, timezone
 
 DEBUG = os.environ.get('SESSION_NORMALIZER_DEBUG') == '1'
@@ -24,9 +27,16 @@ IS_DARWIN = sys.platform == 'darwin'
 HOME = os.path.expanduser('~')
 RAW_PROJECTS_DIR = os.path.join(HOME, '.claude', 'projects')
 STORE_DIR = os.path.join(HOME, '.claude', 'project-sessions')
+SESSIONS_DIR = os.path.join(HOME, '.claude', 'sessions')
 
 PROJECT_MARKERS = ('.git', 'package.json', 'Cargo.toml', 'pyproject.toml',
                    'go.mod', 'pom.xml')
+
+# v3.1 caps
+USER_TEXT_CAP = 2048        # [v3.1 Zeus #4] 2 KB
+ASSIST_TEXT_CAP = 8192      # [v3.1 Zeus #4] 8 KB
+LINE_MAX = 12 * 1024        # 12 KB per history.jsonl line
+TOOL_RESULT_CAP = 200       # tool_result payload truncation
 
 def _warn(msg):
     if DEBUG:
@@ -57,8 +67,6 @@ def _has_marker(d):
     return False
 
 def _find_project_root(cwd):
-    """Walk up to 4 levels from cwd looking for a project marker.
-    Returns (project_root, found_marker_bool)."""
     cur = cwd
     for _ in range(4):
         if _has_marker(cur):
@@ -70,18 +78,14 @@ def _find_project_root(cwd):
     return cwd, False
 
 def _project_key(cwd):
-    """Return (project_key, project_key_cmp, is_generic, is_broken_symlink, project_basename)."""
     root, found = _find_project_root(cwd)
-    # [v3 Zeus #5] realpath + case fold on Darwin
     try:
         real = os.path.realpath(root)
     except Exception:
         real = root
     pk = os.path.normpath(real)
     pk_cmp = pk.lower() if IS_DARWIN else pk
-    # Genericness
     is_generic = (not found) or (pk == HOME) or (pk == '/')
-    # Broken symlink check (realpath returns target even if missing)
     try:
         is_broken = not os.path.exists(pk)
     except Exception:
@@ -89,20 +93,34 @@ def _project_key(cwd):
     basename = os.path.basename(pk) or pk
     return pk, pk_cmp, is_generic, is_broken, basename
 
-def _extract_user_excerpt(msg):
-    """Extract up to 120 chars of user prompt text from a message.content field."""
+def _extract_user_excerpt(msg, cap=120):
     if msg is None:
         return ''
     content = msg.get('content') if isinstance(msg, dict) else None
     if content is None:
         return ''
     if isinstance(content, str):
-        return content[:120]
+        return content[:cap]
     if isinstance(content, list):
         parts = []
         for item in content:
             if isinstance(item, dict):
-                if item.get('type') == 'text':
+                itype = item.get('type')
+                if itype == 'tool_result':
+                    # Include a short marker only; truncate payloads.
+                    tc = item.get('content')
+                    if isinstance(tc, str):
+                        parts.append(tc[:TOOL_RESULT_CAP])
+                    elif isinstance(tc, list):
+                        for sub in tc:
+                            if isinstance(sub, dict) and sub.get('type') == 'text':
+                                t = sub.get('text', '')
+                                if isinstance(t, str):
+                                    parts.append(t[:TOOL_RESULT_CAP])
+                    continue
+                if itype == 'image':
+                    continue  # skip base64 image content
+                if itype == 'text':
                     t = item.get('text', '')
                     if isinstance(t, str):
                         parts.append(t)
@@ -110,11 +128,72 @@ def _extract_user_excerpt(msg):
                     parts.append(item['text'])
             elif isinstance(item, str):
                 parts.append(item)
-        return (' '.join(parts))[:120]
+        return (' '.join(parts))[:cap]
     return ''
 
+def _assistant_primary_arg(tool_name, tool_input):
+    if not isinstance(tool_input, dict):
+        return ''
+    if tool_name in ('Write', 'Edit', 'Read', 'NotebookEdit'):
+        return tool_input.get('file_path') or ''
+    if tool_name in ('Task', 'Agent'):
+        return tool_input.get('description') or ''
+    if tool_name == 'Bash':
+        cmd = tool_input.get('command') or ''
+        toks = cmd.split() if isinstance(cmd, str) else []
+        return toks[0] if toks else ''
+    if tool_name in ('Grep', 'Glob'):
+        return tool_input.get('pattern') or ''
+    return ''
+
+def _extract_assistant_text_and_tools(msg):
+    """Return (text, tools_list). Strips thinking, base64 images, truncates
+    tool_result payloads >200 chars. Assistant text capped at ASSIST_TEXT_CAP."""
+    if not isinstance(msg, dict):
+        return '', []
+    content = msg.get('content')
+    parts = []
+    tools = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get('type')
+            if itype == 'thinking':
+                continue
+            if itype == 'image':
+                continue
+            if itype == 'text':
+                t = item.get('text', '')
+                if isinstance(t, str):
+                    parts.append(t)
+            elif itype == 'tool_use':
+                name = item.get('name') or ''
+                arg = _assistant_primary_arg(name, item.get('input') or {})
+                marker = f'{name}:{arg}' if arg else name
+                if marker:
+                    tools.append(marker)
+                    parts.append(marker)
+            elif itype == 'tool_result':
+                tc = item.get('content')
+                if isinstance(tc, str):
+                    parts.append(tc[:TOOL_RESULT_CAP])
+                elif isinstance(tc, list):
+                    for sub in tc:
+                        if isinstance(sub, dict) and sub.get('type') == 'text':
+                            t = sub.get('text', '')
+                            if isinstance(t, str):
+                                parts.append(t[:TOOL_RESULT_CAP])
+    text = ' '.join(p for p in parts if p)
+    if len(text.encode('utf-8', 'replace')) > ASSIST_TEXT_CAP:
+        # Byte-safe truncation
+        b = text.encode('utf-8', 'replace')[:ASSIST_TEXT_CAP - 3]
+        text = b.decode('utf-8', 'ignore') + '\u2026'
+    return text, tools
+
 def _atomic_write_json(path, obj):
-    """os.open + os.write + fsync + os.replace — the [v3 Zeus #4] discipline."""
     data = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     tmp = path + '.tmp'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -144,17 +223,89 @@ def _slug_from_cwd(cwd):
     return cwd.replace('/', '-')
 
 def _parse_args(argv):
-    """argv is [arg1, arg2]. Returns ('jsonl', path) or ('stdin', None)."""
     if len(argv) >= 2 and argv[0] == '--jsonl' and argv[1]:
         return ('jsonl', argv[1])
     return ('stdin', None)
+
+def _project_slug(project_key, project_key_cmp, is_generic):
+    # [v3 Zeus #10] GENERIC cannot collide - literal string
+    if is_generic:
+        return 'GENERIC'
+    key = project_key_cmp if IS_DARWIN else project_key
+    return key.replace('/', '-').lstrip('-')
+
+def _acquire_drain_lock(tdir):
+    """Atomic PID file write. Returns lock path."""
+    os.makedirs(tdir, exist_ok=True)
+    lock_path = os.path.join(tdir, '.drain.lock')
+    tmp = lock_path + f'.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        f.write(f'{os.getpid()}\n')
+    os.replace(tmp, lock_path)
+    return lock_path
+
+def _release_drain_lock(lock_path):
+    try:
+        os.unlink(lock_path)
+    except Exception:
+        pass
+
+def _append_history_line(history_path, line_bytes):
+    """Single write(2) O_APPEND append, activity-log discipline."""
+    fd = os.open(history_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line_bytes)
+    finally:
+        os.close(fd)
+
+def _build_history_line(obj):
+    """Serialize + enforce 12 KB cap by truncating text field."""
+    s = json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+    data = (s + '\n').encode('utf-8', 'replace')
+    if len(data) <= LINE_MAX:
+        return data
+    # Truncate text to fit.
+    txt = obj.get('text') or ''
+    # Progressively halve
+    while len(data) > LINE_MAX and len(txt) > 8:
+        txt = txt[: max(8, len(txt) // 2)]
+        obj2 = dict(obj)
+        obj2['text'] = txt + '\u2026'
+        s = json.dumps(obj2, ensure_ascii=False, separators=(',', ':'))
+        data = (s + '\n').encode('utf-8', 'replace')
+    if len(data) > LINE_MAX:
+        data = data[:LINE_MAX - 1] + b'\n'
+    return data
+
+def _scan_session_name(sid):
+    """Scan ~/.claude/sessions/*.json for entry matching sessionId. Returns
+    (name, color) or (None, None)."""
+    try:
+        entries = os.listdir(SESSIONS_DIR)
+    except Exception:
+        return None, None
+    for e in entries:
+        if not e.endswith('.json'):
+            continue
+        p = os.path.join(SESSIONS_DIR, e)
+        try:
+            with open(p, 'rb') as f:
+                d = json.loads(f.read().decode('utf-8', 'replace'))
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get('sessionId') == sid:
+            return d.get('name'), d.get('color')
+        if isinstance(d, list):
+            for item in d:
+                if isinstance(item, dict) and item.get('sessionId') == sid:
+                    return item.get('name'), item.get('color')
+    return None, None
 
 try:
     argv = sys.argv[1:]
     mode, jsonl_path = _parse_args(argv)
 
     if mode == 'jsonl':
-        # Derive session_id from filename; project raw-slug from parent dir name.
         if not os.path.isabs(jsonl_path):
             _bail('--jsonl requires absolute path')
         base = os.path.basename(jsonl_path)
@@ -178,18 +329,21 @@ try:
         raw_slug = _slug_from_cwd(cwd0)
         jsonl_path = os.path.join(RAW_PROJECTS_DIR, raw_slug, f'{sid}.jsonl')
 
-    # Stat the JSONL (read-only touch)
+    # TEST_SKIP_SOFTDELETE: guard for test runs against the live session.
+    test_skip_softdelete = os.environ.get('SEGNORM_SKIP_SOFTDELETE') == '1'
+
     try:
         st = os.stat(jsonl_path)
     except Exception as e:
         _bail(f'jsonl stat failed: {e}')
     src_mtime = st.st_mtime
+    src_size = st.st_size
     src_rel = f'{raw_slug}/{sid}.jsonl'
 
-    # ---- Walk the JSONL ----
-    segments = []  # list of dicts
+    # ---- Walk #1: segment boundaries (v3.0 logic) ----
+    segments = []
     cur = None
-    project_cache = {}  # cwd -> (pk, pk_cmp, is_generic, is_broken, basename)
+    project_cache = {}
     msg_idx = -1
 
     def _project_for(cwd):
@@ -223,10 +377,9 @@ try:
             user_excerpt = ''
             if etype == 'user':
                 msg = entry.get('message')
-                user_excerpt = _extract_user_excerpt(msg)
+                user_excerpt = _extract_user_excerpt(msg, cap=120)
 
             if cur is None or cur['project_key'] != pk:
-                # Close prior segment
                 if cur is not None:
                     segments.append(cur)
                 cur = {
@@ -263,8 +416,6 @@ try:
         _bail('no segments')
 
     # ---- [v3 Zeus #2] Blip-segment collapse ----
-    # If a segment has msg_count<3 sandwiched between two segs sharing same
-    # project_key_cmp, merge it into the chronologically prior segment.
     ELIDED_NOTE = ' (brief cd-blip elided)'
     i = 1
     while i < len(segments) - 1:
@@ -274,18 +425,13 @@ try:
         if (s['msg_count'] < 3
                 and prev['project_key_cmp'] == nxt['project_key_cmp']
                 and s['project_key_cmp'] != prev['project_key_cmp']):
-            # Merge blip into prev
             prev['last_msg_idx'] = s['last_msg_idx']
             prev['msg_count'] += s['msg_count']
             if s['last_ts']:
                 prev['last_ts'] = s['last_ts']
             if not prev['first_user_prompt'].endswith(ELIDED_NOTE):
                 prev['first_user_prompt'] = prev['first_user_prompt'] + ELIDED_NOTE
-            # Remove the blip
             del segments[i]
-            # Do NOT advance — next iteration re-examines same index
-            # (now points to what was segments[i+1]); but we may be able to
-            # merge the following segment with prev if they share key.
             if i < len(segments) and segments[i]['project_key_cmp'] == prev['project_key_cmp']:
                 nxt2 = segments[i]
                 prev['last_msg_idx'] = nxt2['last_msg_idx']
@@ -296,67 +442,168 @@ try:
             continue
         i += 1
 
-    # ---- Group segments by project_key ----
+    # ---- Group by project_key ----
     by_project = {}
     for s in segments:
         by_project.setdefault(s['project_key'], []).append(s)
 
-    # ---- [v3 Zeus #3] Fast-path short-circuit ----
-    # For each touched project, check meta.json source_mtimes == src_mtime.
-    # If ALL are up to date, exit 0 with no writes.
-    def _project_slug(project_key, project_key_cmp, is_generic):
-        # [v3 Zeus #10] GENERIC cannot collide — literal string
-        if is_generic:
-            return 'GENERIC'
-        key = project_key_cmp if IS_DARWIN else project_key
-        return key.replace('/', '-').lstrip('-')
-
+    # ---- Compute target slug per project_key ----
     project_dirs = {}  # project_key -> (slug, target_dir)
-    all_fresh = True
     for pk, segs in by_project.items():
         is_gen = segs[0]['is_generic']
         pk_cmp = segs[0]['project_key_cmp']
         slug = _project_slug(pk, pk_cmp, is_gen)
         tdir = os.path.join(STORE_DIR, slug)
         project_dirs[pk] = (slug, tdir)
+
+    # ---- [v3.1 Zeus #9] Fast-path: meta AND history_drained both current ----
+    all_fresh = True
+    for pk, segs in by_project.items():
+        slug, tdir = project_dirs[pk]
         meta = _read_json(os.path.join(tdir, 'meta.json'))
         idx = _read_json(os.path.join(tdir, 'index.json'))
-        # Require BOTH meta.json present and index.json present for fast-path —
-        # meta.json is the sentinel ([v3 Zeus #4]); missing index means half-written.
         if not meta or not idx:
             all_fresh = False
             continue
         src_mtimes = meta.get('source_mtimes') or {}
-        existing = src_mtimes.get(src_rel)
-        # [v3 Zeus #9] exact equality, not < (clock-skew note)
-        if existing != src_mtime:
+        history_drained = meta.get('history_drained') or {}
+        if src_mtimes.get(src_rel) != src_mtime:
             all_fresh = False
+            continue
+        if not history_drained.get(src_rel):
+            all_fresh = False
+            continue
 
     if all_fresh:
         sys.exit(0)
 
-    # ---- Upsert per-project ----
-    now_iso = _now_iso()
-    for pk, segs in by_project.items():
+    # ---- Build (segment_index_0based) for each segment, and map msg_idx->seg ----
+    # Segment index is based on the final post-collapse ordering.
+    segments_by_idx = []
+    for seg_i, seg in enumerate(segments):
+        seg['seg_index'] = seg_i
+        segments_by_idx.append(seg)
+
+    def _segment_for_msg_idx(mi):
+        # Linear scan; segment list is small.
+        for seg in segments_by_idx:
+            if seg['first_msg_idx'] <= mi <= seg['last_msg_idx']:
+                return seg
+        return None
+
+    # ---- Walk #2: text drain into history buffers (grouped by target slug) ----
+    # buffer: slug -> list[bytes]
+    history_buffers = {}
+    # also track per-pk segment membership for output
+
+    # We need to re-open and iterate again.
+    try:
+        fh2 = open(jsonl_path, 'rb')
+    except Exception as e:
+        _warn(f'reopen for drain failed: {e}')
+        fh2 = None
+
+    # Per-slug: skip drain if meta says already drained for this src at this mtime
+    # (but only on a slug-by-slug basis; overall all_fresh was false).
+    slug_skip_drain = {}  # slug -> bool
+    for pk, (slug, tdir) in project_dirs.items():
+        meta = _read_json(os.path.join(tdir, 'meta.json'))
+        if meta:
+            sm = (meta.get('source_mtimes') or {}).get(src_rel)
+            hd = (meta.get('history_drained') or {}).get(src_rel)
+            slug_skip_drain[slug] = (sm == src_mtime and bool(hd))
+        else:
+            slug_skip_drain[slug] = False
+
+    if fh2 is not None:
+        mi2 = -1
         try:
-            slug, tdir = project_dirs[pk]
+            for raw_line in fh2:
+                mi2 += 1
+                try:
+                    entry = json.loads(raw_line.decode('utf-8', errors='replace'))
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                cwd_e = entry.get('cwd')
+                if not cwd_e or not isinstance(cwd_e, str):
+                    continue
+                etype = entry.get('type') or ''
+                if etype not in ('user', 'assistant'):
+                    continue
+                seg = _segment_for_msg_idx(mi2)
+                if seg is None:
+                    continue
+                pk = seg['project_key']
+                slug, _tdir = project_dirs[pk]
+                if slug_skip_drain.get(slug):
+                    continue
+
+                msg = entry.get('message')
+                ts = entry.get('timestamp') or ''
+                seg_idx = seg['seg_index']
+
+                if etype == 'user':
+                    text = _extract_user_excerpt(msg, cap=USER_TEXT_CAP)
+                    if not text:
+                        continue
+                    obj = {
+                        't': ts,
+                        'src_sid': sid,
+                        'seg': seg_idx,
+                        'role': 'user',
+                        'text': text,
+                    }
+                else:
+                    text, tools = _extract_assistant_text_and_tools(msg)
+                    if not text and not tools:
+                        continue
+                    obj = {
+                        't': ts,
+                        'src_sid': sid,
+                        'seg': seg_idx,
+                        'role': 'assistant',
+                        'text': text,
+                    }
+                    if tools:
+                        obj['tools'] = tools
+
+                line = _build_history_line(obj)
+                history_buffers.setdefault(slug, []).append(line)
+        finally:
+            try:
+                fh2.close()
+            except Exception:
+                pass
+
+    # ---- Per-project upsert + drain (with per-slug lock) ----
+    now_iso = _now_iso()
+    any_error = False
+    touched_slugs = []
+
+    for pk, segs in by_project.items():
+        slug, tdir = project_dirs[pk]
+        lock_path = None
+        try:
             os.makedirs(tdir, exist_ok=True)
+            lock_path = _acquire_drain_lock(tdir)
+            touched_slugs.append(slug)
 
             idx_path = os.path.join(tdir, 'index.json')
             meta_path = os.path.join(tdir, 'meta.json')
+            proj_path = os.path.join(tdir, 'project.json')
+            history_path = os.path.join(tdir, 'history.jsonl')
 
             existing_idx = _read_json(idx_path) or {}
             existing_segs = existing_idx.get('segments') or []
             is_gen = segs[0]['is_generic']
             basename = segs[0]['project_basename']
 
-            # Dedup: drop any existing segments matching (session_id, first_msg_idx)
-            # of the segments we're re-emitting.
             new_keys = {(s['session_id'], s['first_msg_idx']) for s in segs}
             kept = [e for e in existing_segs
                     if (e.get('session_id'), e.get('first_msg_idx')) not in new_keys]
 
-            # Serialize new segments (drop internal-only project_key_cmp field)
             serialized = []
             for s in segs:
                 out = {
@@ -387,24 +634,102 @@ try:
                 'total_msgs': total_msgs,
                 'total_sessions': total_sessions,
             }
-
-            # index.json first
             _atomic_write_json(idx_path, idx_obj)
 
-            # meta.json sentinel — LAST
+            # ---- history.jsonl drain (NEW v3.1) ----
+            if not slug_skip_drain.get(slug):
+                lines = history_buffers.get(slug) or []
+                if lines:
+                    blob = b''.join(lines)
+                    _append_history_line(history_path, blob)
+
+            # ---- project.json (NEW v3.1) ----
+            try:
+                sess_name, sess_color = _scan_session_name(sid)
+                # newest last_ts across this project's segments
+                newest_ts = ''
+                for e in merged:
+                    lt = e.get('last_ts') or ''
+                    if lt and lt > newest_ts:
+                        newest_ts = lt
+                existing_proj = _read_json(proj_path) or {}
+                seen = list(existing_proj.get('session_names_seen') or [])
+                if sess_name and sess_name not in seen:
+                    seen.append(sess_name)
+                prior_last_active = existing_proj.get('last_active') or ''
+                prior_last_name = existing_proj.get('last_session_name')
+                if newest_ts and newest_ts >= prior_last_active:
+                    out_last_active = newest_ts
+                    out_last_name = sess_name if sess_name else prior_last_name
+                else:
+                    out_last_active = prior_last_active or newest_ts
+                    out_last_name = prior_last_name
+                proj_obj = {
+                    'version': 1,
+                    'project_key': pk,
+                    'project_basename': basename,
+                    'color': None,
+                    'name': existing_proj.get('name'),
+                    'last_session_name': out_last_name,
+                    'last_session_color': None,
+                    'last_active': out_last_active,
+                    'session_names_seen': seen,
+                }
+                _atomic_write_json(proj_path, proj_obj)
+            except Exception as e:
+                _warn(f'project.json {slug} failed: {e}')
+                any_error = True
+
+            # ---- meta.json sentinel with history_drained flag ----
             existing_meta = _read_json(meta_path) or {}
             src_mtimes = dict(existing_meta.get('source_mtimes') or {})
             src_mtimes[src_rel] = src_mtime
+            history_drained = dict(existing_meta.get('history_drained') or {})
+            history_drained[src_rel] = True
             meta_obj = {
                 'version': 1,
                 'schema_built_at': existing_meta.get('schema_built_at') or now_iso,
                 'source_mtimes': src_mtimes,
+                'history_drained': history_drained,
                 'archive_ptr': existing_meta.get('archive_ptr'),
             }
             _atomic_write_json(meta_path, meta_obj)
+
         except Exception as e:
             _warn(f'upsert {pk} failed: {e}')
-            continue
+            any_error = True
+        finally:
+            if lock_path:
+                _release_drain_lock(lock_path)
+
+    # ---- Soft-delete raw JSONL (v3.1 U#1 / Zeus #1-closed) ----
+    # Guards:
+    #   1. no errors during upsert/drain
+    #   2. jsonl mtime NOT within last 60s (avoid racing Stop)
+    #   3. optional env skip for tests
+    if not any_error and not test_skip_softdelete:
+        try:
+            age = datetime.now(timezone.utc).timestamp() - src_mtime
+        except Exception:
+            age = 0
+        if age >= 60:
+            try:
+                raw_dir = os.path.dirname(jsonl_path)
+                ts_tag = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+                trash_root = os.path.join(raw_dir, '.trash', f'{ts_tag}-{sid}')
+                os.makedirs(trash_root, exist_ok=True)
+                dest_jsonl = os.path.join(trash_root, f'{sid}.jsonl')
+                os.replace(jsonl_path, dest_jsonl)
+                # Sidecar dir (not the .activity.jsonl file - owned by activity-log)
+                sidecar = os.path.join(raw_dir, sid)
+                if os.path.isdir(sidecar):
+                    dest_side = os.path.join(trash_root, sid)
+                    try:
+                        shutil.move(sidecar, dest_side)
+                    except Exception as e:
+                        _warn(f'sidecar move failed: {e}')
+            except Exception as e:
+                _warn(f'soft-delete failed: {e}')
 
     sys.exit(0)
 
