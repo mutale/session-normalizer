@@ -93,6 +93,18 @@ Works on macOS, Linux, and Windows (via Git Bash). No external dependencies beyo
 
 ## Changelog
 
+### v3.1.1 — project-guess + memory-load UX
+
+v3.1.1 is the **UX half** of the v3.1 redesign, built on v3.1.0's proven infrastructure.
+
+- **Project guess on SessionStart**: `hooks/session-start` now ranks projects by confidence (exact cwd match → 1.0; ancestor walk with depth penalty; descendant → 0.4; recency fallback → 0.2) and injects an **offer card** (≤500 chars) for any candidate with confidence ≥ 0.55. GENERIC is never a guess. `$HOME` always falls back to the v2.1 list dialog.
+- **Turn-1 single-question flow**: the `session-manager` skill reads the offer card and fires exactly one AskUserQuestion with `[Yes, load memory / Other project / Fresh start]`. On Yes, it invokes `/compose-brief <project-slug>`.
+- **`/compose-brief`** (new command): reads `~/.claude/project-sessions/<slug>/history.jsonl`, applies a heuristic decay (last ~300 turns verbatim, 300–1500 back summarized per segment with first/last user prompt + top files + msg count, older turns as one-line pointers), budgets 45 KB total (Hebrew multiplier 0.6×), and emits the result verbatim with the `=== PROJECT MEMORY LOAD ===` continuation framing. No preamble — the command's output IS the assistant's response.
+- **Continuation framing**: the injected memory tells the assistant "you are continuing; the user's first message is turn N+1, not a new conversation". The user opens `claude` in a project, types whatever they want, and the assistant acts as if memory has never been lost.
+- **Feature flag** at `~/.claude/project-sessions/.settings.json`: `{"v3_1_memory_load": true}`. Default on; set `false` to fall back to v3.1.0 + v2.1 behavior without re-install.
+- **v2.1 list dialog preserved** as a labeled `v2.1_list_flow` branch in the skill. Users who pick "Other project" get the full project-grouped list. Nothing from v2.1 was removed.
+- **Unchanged from v3.1.0**: history.jsonl drain, soft-delete raw to .trash/, background migrator, drain-on-start fallback, activity log, .zeus.json governance.
+
 ### v3.1.0 — history drain, background migration, drain-on-start fallback
 
 v3.1.0 is the **infrastructure half** of the v3.1 redesign. User-facing UX changes (project guess + offer card + memory-load framing) ship in v3.1.1 on top of this proven base.

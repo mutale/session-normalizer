@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "session-normalizer-local",
   "description": "Local marketplace for session-normalizer plugin",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "owner": {
     "name": "Yehuda"
   },
@@ -10,7 +10,7 @@
     {
       "name": "session-normalizer",
       "description": "Session cleanup, push-on-start resume dialog, crash-safe activity log, and resume-and-merge-others flow for Claude Code",
-      "version": "3.1.0",
+      "version": "3.1.1",
       "source": "./"
     }
   ]
